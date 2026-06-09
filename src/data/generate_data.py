@@ -265,8 +265,10 @@ def insert_projects(cur) -> List[int]:
         (fake.bs().title()[:195], float(rng.uniform(500_000, 50_000_000)))
         for _ in range(50)
     ]
-    execute_values(cur, "INSERT INTO projects (name, budget) VALUES %s RETURNING id", rows)
-    return [r[0] for r in cur.fetchall()]
+    result = execute_values(
+        cur, "INSERT INTO projects (name, budget) VALUES %s RETURNING id", rows, fetch=True
+    )
+    return [r[0] for r in result]
 
 
 def insert_vendors(cur) -> Tuple[List[int], Dict[int, str], Dict[int, str]]:
@@ -289,8 +291,10 @@ def insert_vendors(cur) -> Tuple[List[int], Dict[int, str], Dict[int, str]]:
         for _ in range(total - anomaly_per_cat.get(cat, 0)):
             vendor_rows.append((fake.company()[:195], cat))
 
-    execute_values(cur, "INSERT INTO vendors (name, category) VALUES %s RETURNING id", vendor_rows)
-    ids = [r[0] for r in cur.fetchall()]
+    result = execute_values(
+        cur, "INSERT INTO vendors (name, category) VALUES %s RETURNING id", vendor_rows, fetch=True
+    )
+    ids = [r[0] for r in result]
 
     id_to_cat = {}
     id_to_pattern = {}
@@ -313,12 +317,13 @@ def batch_insert(cur, table: str, columns: List[str], rows: List[Tuple], returni
     result_ids = []
     for i in range(0, len(rows), BATCH_SIZE):
         batch = rows[i : i + BATCH_SIZE]
-        execute_values(
+        returned = execute_values(
             cur,
             f"INSERT INTO {table} ({col_str}) VALUES %s RETURNING {returning}",
             batch,
+            fetch=True,
         )
-        result_ids.extend(r[0] for r in cur.fetchall())
+        result_ids.extend(r[0] for r in returned)
     return result_ids
 
 
