@@ -227,6 +227,52 @@ pytest tests/ -v
 
 ---
 
+## Bugs Caught During Development
+
+These were found through adversarial testing, not during happy-path runs. They're listed because they reveal real failure modes in production ML systems.
+
+---
+
+**1. `psycopg2.execute_values` only returns last page of RETURNING ids**
+
+`execute_values` internally batches rows in pages of 100. After the call, `cur.fetchall()` returns only the results from the **last** batch. With 500 vendors inserted in one call, only 100 IDs came back — so the invoice generation loop ran for 100 vendors, producing 593 invoices instead of the expected 31,044. The database had all 500 vendors (confirmed by a COUNT query), but the application only knew about 100 of them.
+
+Fix: `execute_values(..., fetch=True)` collects all returned rows across all pages.
+
+Why it matters: Silent data loss with no exception raised. The sanity-check query at the end of the generator showed correct vendor counts, masking the bug until invoice volumes were inspected.
+
+---
+
+**2. CUSUM breach checked only on final state — drift that recovers disappears**
+
+The original `update_and_detect` processed all observations in a loop and checked `max(c_pos, abs(c_neg)) > h` once at the end. For the amount-drift vendor, months 11–14 pushed the stat above the threshold, but months 15–17 of normal invoices brought it back down. The final state showed zero severity despite a clear drift event.
+
+Fix: track `ever_breached = True` if the stat exceeds `h` at *any step* during processing, and record `peak_stat` for severity reporting. The severity is based on the highest exceedance seen, not the final value.
+
+Why it matters: This is the exact failure mode CUSUM is designed to prevent. A drift that was resolved (or that an attacker deliberately paced to avoid) would be silently ignored. The fix is one extra variable in the loop, but the absence of it makes the control chart useless for anything but monotonically increasing series.
+
+---
+
+**3. `as_of_date` not passed to CUSUM — historical tests corrupt live state**
+
+The analyze endpoint accepted an `as_of_date` parameter for testing historical windows, but only used it to filter the Isolation Forest feature computation. CUSUM still processed all invoices (up to today) regardless. This meant: (a) the CUSUM state was permanently advanced past the test date, and (b) months of future invoices diluted the anomaly signal being tested.
+
+Fix: simulation mode — when `as_of_date` is provided, CUSUM replays all invoices up to that date from `c_pos=0, c_neg=0` and does not write to the DB. Incremental production mode is unchanged.
+
+Why it matters: Without this separation, every test call against a historical date permanently advances the CUSUM state cursor, making the next production call see zero new observations. Testing and production share the same state store; they need different code paths.
+
+---
+
+**4. Docker healthcheck used `curl` — not present in `python:3.12-slim`**
+
+The backend healthcheck was `curl -sf http://localhost:8000/health`. The `python:3.12-slim` image does not include `curl`. Every healthcheck attempt returned exit code 127 (command not found), the container was declared unhealthy after 10 retries, and the dashboard (which `depends_on: service_healthy`) never started.
+
+Fix: `python -c "import urllib.request; urllib.request.urlopen(...)"` — Python is always present in a Python image.
+
+Why it matters: The failure was silent from the application's perspective — uvicorn started, models loaded, all looked fine in the logs. The only symptom was `dependency failed to start` on the dashboard container. Without knowing to check the healthcheck mechanism specifically, this could be misdiagnosed as a networking issue.
+
+---
+
 ## Architectural Decisions
 
 **CUSUM ever-breached tracking**: Breach is reported if the stat exceeded `h` at *any point* during processing, not just in the final state. This is critical for drift patterns — a vendor that drifted for 4 months and then partially recovered would otherwise show zero severity.
