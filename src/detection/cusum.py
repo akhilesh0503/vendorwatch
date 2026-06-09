@@ -19,7 +19,7 @@ Severity normalisation (agreed before build):
 
 import logging
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 log = logging.getLogger(__name__)
 
@@ -40,19 +40,20 @@ def update_and_detect(
     cur,
     k: float = 0.5,
     h: float = 5.0,
+    as_of: Optional[datetime] = None,
 ) -> Dict:
     """
-    Incrementally update CUSUM for a vendor using only invoices submitted since
-    cusum_state.last_updated. Updates the DB row after each run.
+    Update CUSUM for a vendor and return breach results.
 
-    Returns:
-    {
-        "amount": {
-            "cusum_pos": float, "cusum_neg": float,
-            "n_new_obs": int,   "breach": bool, "severity": float
-        },
-        "days_to_approval": { same shape }
-    }
+    When as_of is provided: simulation mode — replays ALL invoices up to that
+    date from a clean slate (c_pos=0, c_neg=0), does NOT write to DB.
+
+    When as_of is None: incremental mode — processes only invoices since
+    last_updated, writes updated state back to DB.
+
+    In both modes, breach=True if the stat exceeded h at ANY point during
+    processing (not just the final value), so sustained-drift patterns are
+    caught even if later invoices partially recover the stat.
     """
     result = {}
 
@@ -66,56 +67,82 @@ def update_and_detect(
         if row is None:
             result[feature] = {
                 "cusum_pos": 0.0, "cusum_neg": 0.0,
-                "n_new_obs": 0,   "breach": False, "severity": 0.0,
+                "n_new_obs": 0, "breach": False, "severity": 0.0,
             }
             continue
 
-        c_pos, c_neg, mean, std, last_updated = row
-        c_pos = float(c_pos)
-        c_neg = float(c_neg)
-        mean  = float(mean)  if mean  is not None else 0.0
-        std   = float(std)   if std   is not None else 1.0
+        stored_pos, stored_neg, mean, std, last_updated = row
+        mean = float(mean) if mean is not None else 0.0
+        std  = float(std)  if std  is not None else 1.0
 
-        # Fetch new observations since last update
-        if feature == "amount":
-            cur.execute("""
-                SELECT i.amount
-                FROM invoices i
-                WHERE i.vendor_id = %s AND i.submitted_at > %s
-                  AND i.amount IS NOT NULL
-                ORDER BY i.submitted_at ASC
-            """, (vendor_id, last_updated))
+        if as_of is not None:
+            # Simulation: replay full history up to as_of from clean slate
+            c_pos, c_neg = 0.0, 0.0
+            if feature == "amount":
+                cur.execute("""
+                    SELECT i.amount FROM invoices i
+                    WHERE i.vendor_id = %s AND i.submitted_at <= %s
+                      AND i.amount IS NOT NULL
+                    ORDER BY i.submitted_at ASC
+                """, (vendor_id, as_of))
+            else:
+                cur.execute("""
+                    SELECT a.days_to_approval
+                    FROM approvals a JOIN invoices i ON i.id = a.invoice_id
+                    WHERE i.vendor_id = %s AND i.submitted_at <= %s
+                      AND a.days_to_approval IS NOT NULL
+                    ORDER BY i.submitted_at ASC
+                """, (vendor_id, as_of))
+            update_db = False
         else:
-            cur.execute("""
-                SELECT a.days_to_approval
-                FROM approvals a
-                JOIN invoices i ON i.id = a.invoice_id
-                WHERE i.vendor_id = %s AND i.submitted_at > %s
-                  AND a.days_to_approval IS NOT NULL
-                ORDER BY i.submitted_at ASC
-            """, (vendor_id, last_updated))
+            # Incremental: start from stored state, only new invoices
+            c_pos, c_neg = float(stored_pos), float(stored_neg)
+            if feature == "amount":
+                cur.execute("""
+                    SELECT i.amount FROM invoices i
+                    WHERE i.vendor_id = %s AND i.submitted_at > %s
+                      AND i.amount IS NOT NULL
+                    ORDER BY i.submitted_at ASC
+                """, (vendor_id, last_updated))
+            else:
+                cur.execute("""
+                    SELECT a.days_to_approval
+                    FROM approvals a JOIN invoices i ON i.id = a.invoice_id
+                    WHERE i.vendor_id = %s AND i.submitted_at > %s
+                      AND a.days_to_approval IS NOT NULL
+                    ORDER BY i.submitted_at ASC
+                """, (vendor_id, last_updated))
+            update_db = True
 
         observations = [float(r[0]) for r in cur.fetchall()]
 
+        # Track peak and ever-breached across all observations
+        ever_breached = False
+        peak_stat = 0.0
         for obs in observations:
             x     = _standardize(obs, mean, std)
             c_pos = max(0.0, c_pos + x - k)
             c_neg = min(0.0, c_neg + x + k)
+            stat  = max(c_pos, abs(c_neg))
+            if stat > peak_stat:
+                peak_stat = stat
+            if stat > h:
+                ever_breached = True
 
-        cur.execute("""
-            UPDATE cusum_state
-            SET cusum_pos = %s, cusum_neg = %s, last_updated = NOW()
-            WHERE vendor_id = %s AND feature_name = %s
-        """, (c_pos, c_neg, vendor_id, feature))
+        if update_db:
+            cur.execute("""
+                UPDATE cusum_state
+                SET cusum_pos = %s, cusum_neg = %s, last_updated = NOW()
+                WHERE vendor_id = %s AND feature_name = %s
+            """, (c_pos, c_neg, vendor_id, feature))
 
-        stat    = max(c_pos, abs(c_neg))
-        breached = stat > h
+        severity = breach_severity(peak_stat, h) if ever_breached else 0.0
         result[feature] = {
             "cusum_pos":  c_pos,
             "cusum_neg":  c_neg,
             "n_new_obs":  len(observations),
-            "breach":     breached,
-            "severity":   breach_severity(stat, h) if breached else 0.0,
+            "breach":     ever_breached,
+            "severity":   severity,
         }
 
     return result

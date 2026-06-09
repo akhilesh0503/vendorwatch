@@ -74,7 +74,8 @@ async def analyze_vendor(
         explanation = shap_explainer.generate_explanation(shap_dict, feat_vec)
 
     # ── Layer 2: CUSUM ─────────────────────────────────────────────────
-    cusum_result   = cusum.update_and_detect(vendor_id, cur, settings.CUSUM_K, settings.CUSUM_H)
+    cusum_result   = cusum.update_and_detect(vendor_id, cur, settings.CUSUM_K, settings.CUSUM_H,
+                                              as_of=as_of if as_of_date else None)
     cusum_severity = cusum.combined_severity(cusum_result)
     conn.commit()  # persist CUSUM state updates
 
