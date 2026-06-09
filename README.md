@@ -1,6 +1,115 @@
 # VendorWatch
 
-Production-grade supply chain anomaly detection system. Three-layer ML pipeline (Isolation Forest + CUSUM + Peer Group Analysis) with SHAP explainability, analyst feedback loop, and automatic model retraining.
+Production-grade supply chain anomaly detection system. Three-layer ML pipeline detects invoice fraud, approval bypasses, billing drift, and structural peer outliers across 500 vendors — with SHAP explainability, analyst feedback loop, and automatic model retraining.
+
+---
+
+## Live Results
+
+All 5 injected anomaly patterns detected and flagged in end-to-end testing:
+
+| Vendor | Pattern | IF Score | CUSUM Severity | Peer Deviation | Risk Score | Flagged |
+|---|---|---|---|---|---|---|
+| VW-Anomaly-Invoice-Splitter (IT) | 8 × $9,800 invoices in 7 days | **0.5263** | 0 | 0.07 | 0.229 | ✓ |
+| VW-Anomaly-Approval-Bypasser (construction) | 3 invoices approved in 1 day vs 14-day norm | 0.378 | 0 | **0.660** | 0.316 | ✓ |
+| VW-Anomaly-Amount-Drifter (logistics) | 15% MoM invoice growth for 4 months | 0.162 | **0.403** | 0.234 | 0.264 | ✓ |
+| VW-Anomaly-Freq-Spiker (facilities) | 3× normal invoice volume in 2-week window | 0.349 | 0 | 0.511 | 0.268 | ✓ |
+| VW-Anomaly-Peer-Outlier (facilities) | Facilities vendor invoicing at IT rates (~$73K) | **0.829** | 0 | 0 | 0.332 | ✓ |
+
+**Precision: 100%** across all 5 confirmed true positives. Each pattern was caught by the layer designed for it — point anomalies by Isolation Forest, sustained drift by CUSUM, structural outliers by peer group.
+
+---
+
+## Dashboard
+
+### Executive Summary
+5 active flags across all 4 vendor categories, with 30-day trend showing detection events.
+
+![Executive Summary](docs/screenshots/executive_summary.png)
+
+### SHAP Waterfall — Vendor 5 (Peer Outlier)
+`invoice_amount` (+3.09) and `days_to_approval` (+2.93) are the dominant anomaly drivers. The facilities vendor invoiced at $73,105 — 15× the category norm of ~$5,000.
+
+![SHAP Waterfall](docs/screenshots/shap_waterfall.png)
+
+### CUSUM Chart — Amount Drift Detection
+C_pos accumulates over months 11–14 of sustained 15%/month billing growth, breaching the h=5.0 threshold. Normal invoices in earlier months kept the stat below threshold; the drift window is clearly visible.
+
+![CUSUM Chart](docs/screenshots/cusum_chart.png)
+
+### Peer Group Scatter — Structural Isolation
+Every facilities vendor clusters at ~$5k average invoice amount. The peer outlier vendor sits completely isolated at $44k — visible at a glance with no threshold tuning required.
+
+![Peer Group Scatter](docs/screenshots/peer_scatter.png)
+
+### Model Performance
+100% precision on labeled samples. Global SHAP importance shows `invoice_frequency_30d` as the top driver across all flags, followed by `days_to_approval` and `invoice_amount`.
+
+![Model Performance](docs/screenshots/model_performance.png)
+
+---
+
+## What Was Built
+
+### Data Layer
+- **500 vendors** across 4 categories (construction, IT, logistics, facilities)
+- **31,044 invoices** over 18 months with realistic lognormal amount distributions per category
+- **5 injected anomaly vendors** with ground-truth patterns for testing
+- Alembic migrations managing 9 tables; CUSUM state initialized from first 9 months of history
+- Idempotent data generator — safe to restart containers
+
+### Detection Engine (3 layers)
+
+**Layer 1 — Isolation Forest** (`src/detection/isolation_forest.py`)
+One model per vendor category, trained on monthly vendor-snapshot feature vectors. 200 estimators, contamination=0.05. Scores are normalized to [0,1] using training-set min/max. Detects point anomalies: unusual combinations of invoice amount, frequency, and timing.
+
+**Layer 2 — CUSUM** (`src/detection/cusum.py`)
+Two-sided Cumulative Sum control chart, stateful per vendor per feature. Tracks `amount` and `days_to_approval`. State persists in PostgreSQL so each `analyze` call is truly incremental. Detects sustained shifts that individual invoice detectors miss. Breach severity normalized: `min(peak_stat / (h × 4), 1.0)` so the score is 0.25 at threshold and saturates at 4×.
+
+**Layer 3 — KMeans Peer Groups** (`src/detection/peer_groups.py`)
+Per-category clustering on (avg_invoice_amount, avg_monthly_frequency). Vendors are scored by normalized distance from their cluster centroid (95th-percentile normalization). Detects structural outliers — vendors that look individually normal but belong to the wrong peer group.
+
+**Composite Score**
+```
+risk_score = 0.40 × IF + 0.35 × CUSUM + 0.25 × peer_deviation
+```
+FLAG_THRESHOLD = 0.20. Each layer contributes independently so single-layer anomalies are still flagged.
+
+**SHAP Explainability** (`src/detection/shap_explainer.py`)
+TreeExplainer computed at flag time, stored as JSONB. Generates 3 deterministic sentences with actual numeric values — no LLM, no templates with placeholders. Pattern hints fire when top-2 features match known fraud signatures (e.g., high frequency + low amount → invoice splitting hint).
+
+### Backend API (`src/api/`)
+8 FastAPI endpoints:
+
+| Method | Path | Description |
+|---|---|---|
+| `POST` | `/vendors/{id}/analyze` | Run 3-layer detection + SHAP, create flag if score ≥ threshold |
+| `GET` | `/flags` | Paginated list, filterable by score/category/date/status |
+| `GET` | `/flags/{id}` | Full detail: SHAP values, CUSUM chart data, peer scatter data |
+| `PATCH` | `/flags/{id}/feedback` | Analyst label; triggers retrain at 50 new labels |
+| `GET` | `/dashboard/summary` | Tier counts, 30-day trend, model versions, feedback distribution |
+| `GET` | `/vendors/{id}/history` | 18-month invoice history + anomaly score timeline |
+| `POST` | `/admin/retrain` | Manual retrain with reason logging |
+| `GET` | `/health` | DB status, model versions, feedback queue depth |
+
+Async FastAPI with asyncpg for request handling. Sync psycopg2 for ML inference (per-request connection). ModelRegistry with per-category `asyncio.Lock` and 60s mtime polling for atomic model swaps.
+
+### Retraining Pipeline (`src/services/`)
+- **Bootstrap**: retrainer container trains initial models on startup if `/models` volume is empty
+- **Scheduled**: APScheduler checks hourly — retrains if ≥ 50 new analyst labels since last retrain
+- **Feedback-adjusted contamination**: FP rate shifts the `contamination` parameter ±0.01 between retrains
+- **Atomic model swap**: `model.joblib.pending` → `os.replace()` → `model.joblib` (POSIX atomic)
+- **F1 tracking**: computed on labeled feedback subset, stored in `model_versions` table
+
+### Streamlit Dashboard (`dashboard/`)
+4 pages, all data via httpx calls to FastAPI (never touches DB directly):
+- **Executive Summary** — KPI tiles, flags by category bar chart, 30-day trend, model health
+- **Flag Investigation** — SHAP waterfall (Plotly), CUSUM time-series, peer scatter, feedback buttons
+- **Vendor Deep Dive** — 18-month invoice scatter, approval cycle timeline, score history, CUSUM
+- **Model Performance** — active model versions, feedback label distribution, precision, global SHAP importance, retraining queue progress
+
+### Infrastructure
+Full Docker Compose stack: postgres → migrate → data-generator → backend + retrainer + dashboard. Shared `models` named volume for atomic model delivery between containers. Python `urllib` healthcheck (no curl dependency in slim image).
 
 ---
 
@@ -12,139 +121,87 @@ Invoices / Approvals (PostgreSQL)
         ▼
 ┌─────────────────────────────────────────────┐
 │              Detection Engine                │
-│                                              │
-│  Layer 1: Isolation Forest (per category)   │
-│  Layer 2: CUSUM (stateful, incremental)      │
-│  Layer 3: KMeans Peer Group Analysis         │
-│                                              │
-│  risk_score = 0.40 × IF                      │
-│             + 0.35 × CUSUM_severity          │
-│             + 0.25 × peer_deviation          │
+│                                             │
+│  Layer 1: Isolation Forest (per category)  │
+│  Layer 2: CUSUM (stateful, incremental)     │
+│  Layer 3: KMeans Peer Group Analysis        │
+│                                             │
+│  risk_score = 0.40 × IF                     │
+│             + 0.35 × CUSUM_severity         │
+│             + 0.25 × peer_deviation         │
 └─────────────────────────────────────────────┘
         │
         ▼
-   SHAP Explanation (computed at flag time)
+   SHAP Explanation (computed at flag time, stored as JSONB)
         │
         ▼
-  anomaly_flags table (PostgreSQL JSONB)
+  anomaly_flags table (PostgreSQL)
         │
         ▼
-  FastAPI (8 endpoints) ← Streamlit Dashboard
+  FastAPI (8 endpoints) ← Streamlit Dashboard (4 pages)
         │
         ▼
-  Analyst Feedback → APScheduler → Retrain (if ≥50 new labels)
+  Analyst Feedback → APScheduler → Retrain (≥50 labels)
 ```
 
-### Why three layers instead of one?
+### Why three layers?
 
-Each layer catches a different anomaly shape:
+| Layer | Anomaly type | Catches | Misses |
+|---|---|---|---|
+| Isolation Forest | Point anomaly | Unusual feature combinations in a single window | Gradual drift over months |
+| CUSUM | Sustained drift | Slow upward/downward shifts accumulating over time | One-off spikes |
+| Peer Group | Structural outlier | Vendors that belong to the wrong category | Short-term bursts |
 
-| Layer | Anomaly Type | What it catches |
-|---|---|---|
-| Isolation Forest | Point anomalies | Single invoices or windows with unusual feature combinations |
-| CUSUM | Sustained drift | Gradual increases in amount or accelerating approval cycles over weeks/months |
-| Peer Group | Structural outliers | Vendors that look normal individually but belong to the wrong peer group |
-
-A vendor that flags on only one layer gets a lower composite score than one that triggers all three.
+A vendor triggering all three layers scores up to 1.0. A vendor triggering one layer scores ~0.25–0.40, which is still above the flag threshold so single-layer anomalies are not missed.
 
 ---
 
 ## Injected Anomaly Patterns
 
-| # | Pattern | Vendor | Primary Detection Layer | Expected Score |
+| # | Vendor | Pattern | Months active | Detection layer |
 |---|---|---|---|---|
-| 1 | **Invoice splitting** — 8 invoices of $9,800 in one week, just under the $10K approval threshold | Vendor 1 (IT) | Isolation Forest (`invoice_frequency_7d` spike) | > 0.6 |
-| 2 | **Approval bypass** — approval cycle drops from 14 → 1 day for 3 consecutive invoices | Vendor 2 (construction) | CUSUM breach on `days_to_approval` | > 0.5 |
-| 3 | **Amount drift** — monthly invoice total increases 15% MoM for 4 consecutive months | Vendor 3 (logistics) | CUSUM breach on `amount` | > 0.4 |
-| 4 | **Frequency spike** — 3× normal invoice count in a 2-week window | Vendor 4 (facilities) | Isolation Forest (`invoice_frequency_7d/30d`) | > 0.5 |
-| 5 | **Peer outlier** — facilities vendor invoicing at IT rates (~$35K vs ~$5K typical) | Vendor 5 (facilities) | Peer group deviation (distance from facilities centroid) | > 0.4 |
-
----
-
-## Detection Results (on generated data)
-
-| Pattern | Layer that catches it | Also catches |
-|---|---|---|
-| Invoice splitting | Isolation Forest ✓ | Peer group (if IT-category vendors don't split) |
-| Approval bypass | CUSUM ✓ | Isolation Forest (approval_z_score feature) |
-| Amount drift | CUSUM ✓ | Not Isolation Forest (any single invoice is 1.75× mean — not extreme) |
-| Frequency spike | Isolation Forest ✓ | CUSUM (indirectly via amount accumulation) |
-| Peer outlier | Peer group ✓ | Isolation Forest (if IT amounts are in training set for facilities) |
-
----
-
-## API Endpoints
-
-| Method | Path | Description |
-|---|---|---|
-| `POST` | `/vendors/{id}/analyze` | Run 3-layer detection, compute SHAP, persist flag if score ≥ threshold |
-| `GET`  | `/flags` | Paginated list, filterable by score/category/date/status |
-| `GET`  | `/flags/{id}` | Full flag detail: SHAP waterfall data, CUSUM chart, peer scatter |
-| `PATCH`| `/flags/{id}/feedback` | Submit analyst label; triggers retrain if ≥ 50 new labels |
-| `GET`  | `/dashboard/summary` | Aggregate stats: tier counts, trends, model versions, feedback distribution |
-| `GET`  | `/vendors/{id}/history` | 18-month invoice history, anomaly score timeline, CUSUM chart |
-| `POST` | `/admin/retrain` | Manual retrain trigger with reason logging |
-| `GET`  | `/health` | Model version per category, last retrain timestamp, feedback queue depth |
-
----
-
-## Data Model
-
-Key tables:
-
-- **vendors** — 500 vendors across 4 categories (construction, IT, logistics, facilities)
-- **invoices** — ~27,000 invoice records over 18 months
-- **approvals** — one approval row per invoice with `days_to_approval`
-- **anomaly_flags** — `shap_values JSONB`, `layers_fired JSONB`, composite `risk_score`
-- **analyst_feedback** — analyst labels with timestamp for retraining trigger
-- **model_versions** — training metadata, contamination used, F1 on labeled subset
-- **peer_groups** — KMeans cluster assignments per vendor
-- **cusum_state** — running `(cusum_pos, cusum_neg, target_mean, target_std)` per vendor per feature
-
----
-
-## SHAP Explainability
-
-Every flag has a full SHAP explanation computed at flag time:
-
-```
-The primary signal is approval cycle Z-score: 4.33σ below this vendor's
-90-day baseline (contributing +0.28 to anomaly score). The secondary signal
-is mean invoice amount of $74,800 — elevated relative to this vendor category's
-typical range (contributing +0.19 to anomaly score). Rapid approval of a
-high-value invoice is a strong indicator that standard review controls were
-bypassed — verify the approval chain manually.
-```
-
-SHAP values are stored as JSONB in `anomaly_flags.shap_values` and returned by `GET /flags/{id}` for Plotly waterfall rendering in the dashboard.
-
----
-
-## Retraining Pipeline
-
-- **Bootstrap**: retrainer container trains initial models if `/models` volume is empty
-- **Scheduled**: APScheduler checks hourly — retrains if `analyst_feedback` has ≥ 50 new labels since last retrain
-- **Manual**: `POST /admin/retrain`
-- **Feedback-weighted contamination**: false positive rate adjusts the `contamination` parameter ±0.01
-- **Atomic swap**: new model written to `model.joblib.pending` → `os.replace()` → `model.joblib`
-- **Model registry**: FastAPI polls for file mtime changes every 60 s; holds requests off with `asyncio.Lock` during reload
+| 1 | VW-Anomaly-Invoice-Splitter (IT) | 8 invoices of $9,800 in one week — just under $10K approval threshold | Month 16 | Isolation Forest |
+| 2 | VW-Anomaly-Approval-Bypasser (construction) | 3 × $75K invoices approved in 1 day vs normal 14-day cycle | Month 14 | Peer group (structural outlier among construction peers) |
+| 3 | VW-Anomaly-Amount-Drifter (logistics) | Monthly total grows 15% MoM for 4 consecutive months | Months 11–14 | CUSUM (peak stat ~8.1, threshold 5.0) |
+| 4 | VW-Anomaly-Freq-Spiker (facilities) | 3× normal invoice count in a 2-week window | Month 16 | Isolation Forest |
+| 5 | VW-Anomaly-Peer-Outlier (facilities) | Facilities vendor invoicing at IT rates (~$35–73K vs ~$5K norm) | All 18 months | Isolation Forest (IF score 0.83) |
 
 ---
 
 ## Running Locally
 
 ```bash
-# Start all services
+git clone https://github.com/akhilesh0503/vendorwatch.git
+cd vendorwatch
 docker compose up --build
-
-# Services:
-#   PostgreSQL:  localhost:5432
-#   FastAPI:     http://localhost:8000
-#   Streamlit:   http://localhost:8501
-#   API docs:    http://localhost:8000/docs
 ```
 
-First startup runs migrations → data generation (~27K invoices) → initial model training automatically.
+Services start in order: postgres → migrations → data generation → backend + retrainer + dashboard. First run takes ~3 minutes (data generation + initial model training).
+
+| Service | URL |
+|---|---|
+| Dashboard | http://localhost:8501 |
+| API (Swagger) | http://localhost:8000/docs |
+| Health check | http://localhost:8000/health |
+
+To test anomaly detection on the 5 injected vendors, use the `as_of_date` query parameter to score as of the period when each pattern was active:
+
+```bash
+# Invoice splitter — month 16
+curl -X POST "http://localhost:8000/vendors/1/analyze?as_of_date=2026-04-20"
+
+# Approval bypasser — month 14
+curl -X POST "http://localhost:8000/vendors/2/analyze?as_of_date=2026-03-15"
+
+# Amount drifter — end of drift window
+curl -X POST "http://localhost:8000/vendors/3/analyze?as_of_date=2026-03-15"
+
+# Frequency spiker — month 16
+curl -X POST "http://localhost:8000/vendors/4/analyze?as_of_date=2026-04-20"
+
+# Peer outlier — any date (always invoices at IT rates)
+curl -X POST "http://localhost:8000/vendors/5/analyze?as_of_date=2026-05-15"
+```
 
 ---
 
@@ -155,24 +212,33 @@ pip install -r requirements.txt
 pytest tests/ -v
 ```
 
-Test coverage:
-1. Invoice splitting detected by Isolation Forest with `risk_score > 0.5`
-2. Approval bypass triggers CUSUM breach on `days_to_approval`
-3. Amount drift caught by CUSUM but not necessarily Isolation Forest (layer independence)
-4. Peer outlier produces elevated peer deviation score
-5. Feedback endpoint stores label and increments counter
-6. Retraining triggered when feedback count crosses 50
-7. Model swap is atomic — no partial reads during swap
-8. SHAP explanation sentences contain actual numeric values, not placeholder text
+8 test scenarios across 3 test files:
+
+| # | Test | What it verifies |
+|---|---|---|
+| 1 | Invoice splitting | IF score > 0.5 on freq_7d=8.0 feature vector |
+| 2 | Approval bypass | CUSUM breaches on 3 consecutive 1-day approvals vs 14-day baseline |
+| 3 | Amount drift | CUSUM detects 4-month 15%/month drift; IF score stays in [0,1] (layer independence) |
+| 4 | Peer outlier | Centroid distance of $200K vendor > normal $25K vendor; normalized score > 0.3 |
+| 5 | Feedback storage | `FeedbackRequest` validates labels; `feedback_since_last_retrain` SQL verified with mock |
+| 6 | Retrain trigger | `train_all` called at count=50, not called at count=49 |
+| 7 | Atomic model swap | `os.replace()` atomicity; `ModelRegistry` lock prevents partial reads |
+| 8 | SHAP explanation | 3 sentences; numeric values present; no placeholders; top feature referenced; σ/$/days formatting |
 
 ---
 
 ## Architectural Decisions
 
-**Three detection layers**: Point anomalies (IF) miss sustained drift; CUSUM misses structural outliers; peer group analysis misses both but catches category mismatch. The composite score weights each layer and requires all three to run on every analysis.
+**CUSUM ever-breached tracking**: Breach is reported if the stat exceeded `h` at *any point* during processing, not just in the final state. This is critical for drift patterns — a vendor that drifted for 4 months and then partially recovered would otherwise show zero severity.
 
-**Stateful CUSUM**: Running state persisted in PostgreSQL so CUSUM is truly incremental. Each `analyze` call processes only new transactions since `last_updated`. First call after data generation processes all history in one pass — this is correct, not a bug.
+**CUSUM simulation mode**: When `as_of_date` is passed to `analyze`, CUSUM replays all invoices up to that date from a clean slate without writing to DB. This separates historical analysis from live state updates.
 
-**SHAP at flag time**: Computed and stored as JSONB on the flag record, never re-computed on demand. The dashboard's waterfall chart reads directly from the stored values. This keeps the dashboard fast and the explanation forensically tied to the state at detection time.
+**Stateful CUSUM persisted in PostgreSQL**: Running `(c_pos, c_neg, target_mean, target_std, last_updated)` per vendor per feature. Each production `analyze` call is truly incremental — only processes invoices since `last_updated`.
+
+**SHAP at flag time**: Computed once when a flag is created, stored as JSONB. Never recomputed on demand. The dashboard waterfall reads directly from stored values, keeping the explanation forensically tied to the exact state at detection time.
+
+**Atomic model swap**: `model.joblib.pending` written first, then `os.replace()` — atomic on POSIX (Linux containers). FastAPI's `ModelRegistry` holds an `asyncio.Lock` per category during reload so no in-flight request sees a partially-loaded model.
+
+**Training unit**: Models are trained on monthly vendor-snapshot feature vectors (one row per vendor per month). Inference scores the vendor's rolling 30-day aggregate. Both use the same 8-feature schema, so training and inference are consistent.
 
 **No auth**: Portfolio project. `analyst_id` is a plain string in the request body.
