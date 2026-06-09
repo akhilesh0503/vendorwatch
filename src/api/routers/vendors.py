@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 import psycopg2
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from src.api.schemas import AnalyzeResponse, VendorHistoryResponse
 from src.config import get_settings
@@ -27,7 +27,13 @@ def _sync_conn():
 
 
 @router.post("/{vendor_id}/analyze", response_model=AnalyzeResponse)
-async def analyze_vendor(vendor_id: int):
+async def analyze_vendor(
+    vendor_id: int,
+    as_of_date: Optional[str] = Query(
+        default=None,
+        description="ISO date string (YYYY-MM-DD) to score as of a historical date. Defaults to today.",
+    ),
+):
     conn = _sync_conn()
     cur  = conn.cursor()
 
@@ -48,7 +54,15 @@ async def analyze_vendor(vendor_id: int):
             detail=f"No trained model for category '{vcategory}'. Trigger POST /admin/retrain first.",
         )
 
-    as_of      = datetime.now()
+    if as_of_date:
+        try:
+            as_of = datetime.strptime(as_of_date, "%Y-%m-%d")
+        except ValueError:
+            conn.close()
+            raise HTTPException(status_code=422, detail="as_of_date must be YYYY-MM-DD")
+    else:
+        as_of = datetime.now()
+
     feat_vec   = features.compute_vendor_features(vendor_id, cur, as_of)
     if_score   = 0.0
     shap_dict  = None
