@@ -1,0 +1,94 @@
+version: "3.9"
+
+services:
+  # ── Infrastructure ──────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB:       vendorwatch
+      POSTGRES_USER:     vendorwatch
+      POSTGRES_PASSWORD: vendorwatch
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vendorwatch -d vendorwatch"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+  # ── Schema migrations ────────────────────────────────────────────────────
+  migrate:
+    build:
+      context: .
+      dockerfile: docker/migrate/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://vendorwatch:vendorwatch@postgres:5432/vendorwatch
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ── Synthetic data (runs once on first startup) ──────────────────────────
+  data-generator:
+    build:
+      context: .
+      dockerfile: docker/data_generator/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://vendorwatch:vendorwatch@postgres:5432/vendorwatch
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: "no"
+
+  # ── Phase 2+ — uncomment as each phase is built ─────────────────────────
+
+  # backend:
+  #   build:
+  #     context: .
+  #     dockerfile: docker/backend/Dockerfile
+  #   environment:
+  #     DATABASE_URL: postgresql+asyncpg://vendorwatch:vendorwatch@postgres:5432/vendorwatch
+  #     MODELS_DIR: /models
+  #   ports:
+  #     - "8000:8000"
+  #   volumes:
+  #     - models:/models
+  #   depends_on:
+  #     data-generator:
+  #       condition: service_completed_successfully
+  #   healthcheck:
+  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+  # retrainer:
+  #   build:
+  #     context: .
+  #     dockerfile: docker/retrainer/Dockerfile
+  #   environment:
+  #     DATABASE_URL: postgresql://vendorwatch:vendorwatch@postgres:5432/vendorwatch
+  #     MODELS_DIR: /models
+  #   volumes:
+  #     - models:/models
+  #   depends_on:
+  #     - backend
+
+  # dashboard:
+  #   build:
+  #     context: .
+  #     dockerfile: docker/dashboard/Dockerfile
+  #   environment:
+  #     API_BASE_URL: http://backend:8000
+  #   ports:
+  #     - "8501:8501"
+  #   depends_on:
+  #     backend:
+  #       condition: service_healthy
+
+volumes:
+  pgdata:
+  models:
