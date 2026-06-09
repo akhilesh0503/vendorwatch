@@ -14,7 +14,7 @@ IF_WEIGHT    = 0.40
 CUSUM_WEIGHT = 0.35
 PEER_WEIGHT  = 0.25
 
-FLAG_THRESHOLD   = 0.35  # minimum risk_score to create a flag
+FLAG_THRESHOLD   = 0.20  # minimum risk_score to create a flag
 IF_FIRE_THRESHOLD   = 0.50  # IF score above which the layer "fires"
 PEER_FIRE_THRESHOLD = 0.60  # peer deviation score above which the layer fires
 
