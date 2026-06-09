@@ -43,40 +43,44 @@ services:
         condition: service_completed_successfully
     restart: "no"
 
-  # ── Phase 2+ — uncomment as each phase is built ─────────────────────────
+  # ── Backend API ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend/Dockerfile
+    environment:
+      DATABASE_URL:      postgresql+asyncpg://vendorwatch:vendorwatch@postgres:5432/vendorwatch
+      SYNC_DATABASE_URL: postgresql://vendorwatch:vendorwatch@postgres:5432/vendorwatch
+      MODELS_DIR:        /models
+    ports:
+      - "8000:8000"
+    volumes:
+      - models:/models
+    depends_on:
+      data-generator:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
 
-  # backend:
-  #   build:
-  #     context: .
-  #     dockerfile: docker/backend/Dockerfile
-  #   environment:
-  #     DATABASE_URL: postgresql+asyncpg://vendorwatch:vendorwatch@postgres:5432/vendorwatch
-  #     MODELS_DIR: /models
-  #   ports:
-  #     - "8000:8000"
-  #   volumes:
-  #     - models:/models
-  #   depends_on:
-  #     data-generator:
-  #       condition: service_completed_successfully
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 5
+  # ── Retraining service ────────────────────────────────────────────────
+  retrainer:
+    build:
+      context: .
+      dockerfile: docker/retrainer/Dockerfile
+    environment:
+      DATABASE_URL:      postgresql://vendorwatch:vendorwatch@postgres:5432/vendorwatch
+      SYNC_DATABASE_URL: postgresql://vendorwatch:vendorwatch@postgres:5432/vendorwatch
+      MODELS_DIR:        /models
+    volumes:
+      - models:/models
+    depends_on:
+      data-generator:
+        condition: service_completed_successfully
 
-  # retrainer:
-  #   build:
-  #     context: .
-  #     dockerfile: docker/retrainer/Dockerfile
-  #   environment:
-  #     DATABASE_URL: postgresql://vendorwatch:vendorwatch@postgres:5432/vendorwatch
-  #     MODELS_DIR: /models
-  #   volumes:
-  #     - models:/models
-  #   depends_on:
-  #     - backend
-
+  # ── Dashboard (Phase 4) ───────────────────────────────────────────────
   # dashboard:
   #   build:
   #     context: .
