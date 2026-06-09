@@ -80,18 +80,18 @@ services:
       data-generator:
         condition: service_completed_successfully
 
-  # ── Dashboard (Phase 4) ───────────────────────────────────────────────
-  # dashboard:
-  #   build:
-  #     context: .
-  #     dockerfile: docker/dashboard/Dockerfile
-  #   environment:
-  #     API_BASE_URL: http://backend:8000
-  #   ports:
-  #     - "8501:8501"
-  #   depends_on:
-  #     backend:
-  #       condition: service_healthy
+  # ── Dashboard ─────────────────────────────────────────────────────────
+  dashboard:
+    build:
+      context: .
+      dockerfile: docker/dashboard/Dockerfile
+    environment:
+      API_BASE_URL: http://backend:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      backend:
+        condition: service_healthy
 
 volumes:
   pgdata:
